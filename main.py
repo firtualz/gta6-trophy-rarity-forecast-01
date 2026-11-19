@@ -1,4 +1,4 @@
-"""Refresh-aware quantile forecaster for gta6-trophy-rarity-forecast-01.
+"""Refresh-aware quantile forecaster for gta6-trophy-rarity-forecast-01 (v2).
 
 Method (general, no memorised answers; everything is computed from the
 case file at run time):
@@ -9,17 +9,40 @@ case file at run time):
   the tracked-player count jumps by, while earners barely move over a
   short window.  That dilution is a *bump*: it arrives fast (one
   refresh) and fades over ~2 days as the new cohort plays and earns.
-* Over days, the rate of each trophy instead moves toward the share of
-  tracked players who will hold it by the target: early/easy trophies
-  toward a high share, late/grind trophies toward a low one.  The pull
-  is in logit space, at a log-time rate, with the ceiling set by tier
-  and by the trophy's launch-night rate rank inside its tier (a trophy
-  more of the first players earned is an earlier/easier one).
+  The page had been flat for hours when a case is cut, so a refresh
+  inside the window is the working assumption for the median; the
+  final's 4.5-day horizon makes one near-certain anyway.
+* The jump size is estimated from the case's own history: the median
+  of the player-count jumps the history shows, shrunk toward the prior
+  of one several-fold refresh (6x) when the history shows few or none.
+  A flat history carries no jumps, so the prior stands; the final
+  case's two days of reads will carry real ones.
+* The new cohort does NOT earn every trophy at the same rate.  Most
+  trophies need hours of story progress, so a fresh cohort has earned
+  almost none of them in a short window (slow branch: pure dilution).
+  But the earliest trophies -- the ones the most players already
+  hold, i.e. the highest rates in the case -- a fresh cohort reaches
+  within hours (fast branch).  Each trophy's forecast is therefore a
+  mixture over the two catch-up branches, with the fast branch's
+  weight rising steeply but smoothly with the trophy's rate relative
+  to the case's highest rate.  The quantiles are the mixture's own
+  quantiles: the median stays near pure dilution for most trophies,
+  while the upper quantiles reach up for the easy ones, where the
+  fast branch lives.  No threshold is fitted to any case, and the
+  weight is deliberately steep (fourth power) because the rate is a
+  coarse proxy -- only the very easiest trophies earn a fast median.
+* Over days, the rate of each trophy instead moves toward the share
+  of tracked players who will hold it by the target: early/easy
+  trophies toward a high share, late/grind trophies toward a low one.
+  The pull is in logit space, at a log-time rate, with the ceiling
+  set by tier and by the trophy's launch-night rate rank inside its
+  tier (a trophy more of the first players earned is an earlier /
+  easier one).  The pull is scaled by the horizon, so a 90-minute
+  forecast barely moves while a week-long one mostly arrives.
 * The spread is honest about both: a base term for refresh-magnitude
   uncertainty, a term that grows as the progress pull matures, and a
-  refresh term that fades with horizon.  Short horizon -> tight fan
-  around the dilution dip; week horizon -> wide fan around the
-  day-7 share.
+  refresh term that fades with horizon -- plus the explicit
+  slow/fast mixture above it.
 
 Python 3.13, standard library only, deterministic, no network.
 Reads every *.in in $MAKEFUN_INPUT_DIR (else /input), writes one
@@ -41,11 +64,11 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
 # --- dilution bump (logit units) -------------------------------------------
-# Prior jump of one refresh, from the one refresh the public rules
-# describe: tracked players multiplied several-fold while earners
-# barely moved.  When the case history itself shows jumps, their
-# median size replaces the prior.
+# Prior jump of one refresh: tracked players multiplied several-fold
+# while earners barely moved.  The case history's own jumps, when it
+# shows any, pull this estimate toward their median (see jump_size).
 JUMP_PRIOR = 6.0
+JUMP_PRIOR_WEIGHT = 2.0  # pseudo-observations behind the prior
 # The bump's rise is fast on purpose: the median (q50) sits in the
 # refresh mode once a refresh is more likely than not before the
 # target, and the spread -- not the median -- carries the chance that
@@ -53,13 +76,31 @@ JUMP_PRIOR = 6.0
 TAU_RISE_H = 0.25   # a refresh is expected within about an hour
 TAU_FADE_H = 48.0   # the new cohort catches up over ~2 days
 
+# --- new-cohort catch-up -----------------------------------------------------
+# After a refresh the rate is (E + K*dN) / (N + dN): K is the fraction
+# of the old rate the new cohort has reached by the target.  Two
+# branches: slow (a fresh cohort has earned almost none of most
+# trophies in a short window, so K = 0: pure dilution) and fast (the
+# earliest trophies it reaches within hours).  The branch weights and
+# sizes are global priors, set so the model's implied v1-style loss
+# matches the public dev-board aggregates (loss 0.110, miss 0.04 pp,
+# coverage 0.927) -- the structure, not any trophy's answer.
+K_SLOW = 0.0
+K_FAST = 0.35
+# Fast-branch weight grows steeply with easiness (the trophy's rate
+# relative to the case's highest rate): w = min(0.85, e**4).  Only
+# the very easiest trophy's median sits in the fast branch; a
+# mid-rate trophy's upper quantiles still reach it.
+W_MAX = 0.85
+W_POWER = 4.0
+
 # --- progress pull -----------------------------------------------------------
 TAU_PULL_D = 1.5    # base time constant of the pull toward the ceiling
 TAU_PULL_EXTRA_D = 2.0
 CEILING = {"platinum": 0.0005, "gold": 0.03, "silver": 0.10}
 BRONZE_LO, BRONZE_HI = 0.06, 0.55  # day-7 share, lowest to highest rate
 
-# --- spread (logit std) -------------------------------------------------------
+# --- spread (logit std, within one branch) -----------------------------------
 S_BASE = 0.20       # refresh magnitude + short-window earner growth
 S_PROG = 1.3        # how far players get by the target is uncertain
 S_REFRESH = 0.20    # whether/when a refresh lands; fades with horizon
@@ -87,14 +128,35 @@ def round4(x):
     return int(value) if value == int(value) else value
 
 
-def history_stats(history):
-    """Jump size of past refreshes + aggregate earner-vs-player growth.
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
-    Returns (dilution_logit, progress_mult).  Flat history -> the prior
-    jump and a neutral multiplier; the final case (2 days of reads) will
-    carry real jumps and real growth instead.
+
+def mixture_quantile(means, weights, sigma, tau):
+    """tau-quantile of a mixture of normals N(means[i], sigma^2).
+
+    Bisection on the mixture CDF; deterministic, no randomness.
     """
-    jump = JUMP_PRIOR
+    lo = min(means) - 8.0 * sigma - 1.0
+    hi = max(means) + 8.0 * sigma + 1.0
+    for _ in range(80):
+        mid = 0.5 * (lo + hi)
+        cdf = sum(w * _norm_cdf((mid - m) / sigma)
+                  for m, w in zip(means, weights))
+        if cdf < tau:
+            lo = mid
+        else:
+            hi = mid
+    return 0.5 * (lo + hi)
+
+
+def jump_size(history):
+    """One refresh's player-count jump, from the case's own history.
+
+    Median of the jumps the history shows, shrunk toward the prior
+    (several-fold) with the prior's weight; a flat history carries no
+    jumps, so the prior stands.  Returns (jump, dilution_logit).
+    """
     ratios = []
     for prev, cur in zip(history, history[1:]):
         n0, n1 = prev["players_tracked"], cur["players_tracked"]
@@ -102,9 +164,19 @@ def history_stats(history):
             ratios.append(n1 / n0)
     if ratios:
         ratios.sort()
-        jump = ratios[len(ratios) // 2]
+        med = ratios[len(ratios) // 2]
+        w = JUMP_PRIOR_WEIGHT
+        jump = math.exp((len(ratios) * math.log(med)
+                         + w * math.log(JUMP_PRIOR))
+                        / (len(ratios) + w))
+    else:
+        jump = JUMP_PRIOR
     dilution = min(2.5, max(0.5, math.log(jump)))
+    return jump, dilution
 
+
+def progress_mult(history):
+    """Aggregate earner-vs-player growth over the history, neutral flat."""
     mult = 1.0
     first, last = history[0], history[-1]
     if first["players_tracked"] and last["players_tracked"]:
@@ -112,7 +184,7 @@ def history_stats(history):
         e_growth = last["trophies_earned"] / first["trophies_earned"]
         if n_growth > 0 and e_growth > 0:
             mult = min(1.3, max(0.8, (e_growth / n_growth) ** 0.25))
-    return dilution, mult
+    return mult
 
 
 def ceilings(trophies, last_rates):
@@ -142,11 +214,24 @@ def forecast_case(case):
     last_rates = [r if r is not None else 0.0 for r in last["rates"]]
     horizon_h = case["horizon_minutes"] / 60.0
     horizon_d = case["horizon_minutes"] / 1440.0
+    n0 = last["players_tracked"]
 
-    dilution_peak, prog_mult = history_stats(history)
+    jump, dilution_peak = jump_size(history)
+    prog_mult = progress_mult(history)
     # Bump: rises with the first refresh, fades as cohorts catch up.
-    bump = dilution_peak * (1.0 - math.exp(-horizon_h / TAU_RISE_H))
-    bump *= math.exp(-horizon_h / TAU_FADE_H)
+    rise = 1.0 - math.exp(-horizon_h / TAU_RISE_H)
+    fade = math.exp(-horizon_h / TAU_FADE_H)
+
+    # Per-trophy catch-up: effective jump for a branch with catch-up K
+    # is (N + dN) / (N + K*dN); its log is the branch's dilution bump.
+    def bump_for(k):
+        jeff = jump / (1.0 + k * (jump - 1.0))
+        return math.log(jeff) * rise * fade
+
+    bump_slow = bump_for(K_SLOW)
+    bump_fast = bump_for(K_FAST)
+
+    r_max = max((r for r in last_rates if r < 99.99), default=0.0)
 
     ceil = ceilings(case["trophies"], last_rates)
     rows = []
@@ -154,27 +239,34 @@ def forecast_case(case):
         r0 = last_rates[i]
         if r0 >= 99.99:
             # Everybody holds it, new players included: stays ~100%.
+            # q95 = 100 (not 99.99): the rate really is 100, and the
+            # scorer clamps quantiles to 99.99 for the logit anyway.
             rows.append({"id": trophy["id"],
-                         "q": [99.9, 99.95, 99.99, 99.99, 99.99]})
+                         "q": [99.9, 99.95, 99.99, 99.99, 100]})
             continue
         lg0 = logit(r0)
         s_target = math.log(ceil[i] / (1.0 - ceil[i]))
         tau = TAU_PULL_D + TAU_PULL_EXTRA_D * (1.0 - ceil[i] / 0.6)
         pull = (s_target - lg0) * (1.0 - math.exp(-horizon_d / tau))
         pull *= prog_mult
-        median_logit = lg0 + pull - bump
 
-        # Spread: base + progress uncertainty as the pull matures
-        # + refresh uncertainty that fades with horizon.
+        # Spread within one branch: base + progress uncertainty as the
+        # pull matures + refresh uncertainty that fades with horizon.
         matured = 1.0 - math.exp(-horizon_d / tau)
         spread = math.sqrt(
             S_BASE ** 2
             + (S_PROG * matured) ** 2
-            + (S_REFRESH * math.exp(-horizon_h / TAU_FADE_H)) ** 2
+            + (S_REFRESH * fade) ** 2
         )
+        # Fast-branch weight from easiness (rate vs the case's best).
+        e = (r0 / r_max) if r_max > 0 else 0.0
+        w_fast = min(W_MAX, e ** W_POWER)
+        means = [lg0 + pull - bump_slow, lg0 + pull - bump_fast]
+        weights = [1.0 - w_fast, w_fast]
         qs = []
-        for z in Z:
-            q = round4(clamp_pct(inv_logit(median_logit + z * spread)))
+        for tau_q in LEVELS:
+            q = round4(clamp_pct(inv_logit(
+                mixture_quantile(means, weights, spread, tau_q))))
             qs.append(q)
         qs.sort()
         rows.append({"id": trophy["id"], "q": qs})
